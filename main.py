@@ -1,179 +1,167 @@
 """
-main.py - Squat Form Analyzer
-==============================
-Real-time squat form detection using your webcam.
-
-Detects body landmarks via MediaPipe Pose, calculates knee and hip angles,
-validates squat form, counts reps, and displays live visual feedback.
+main.py - Fullscreen AI Squat Form Analyzer
+===========================================
+Real-time, edge-to-edge fullscreen squat tracking using MediaPipe Pose.
+Calculates knee angles, depth progress, torso posture, counts reps,
+and displays a sleek fitness coach HUD with zero borders or clutter.
 
 Controls:
-    Q  →  Quit
-    R  →  Reset rep counter
-
-Usage:
-    python main.py
+    Q / ESC  →  Quit
+    R        →  Reset Rep Counter
+    F        →  Toggle Fullscreen
 """
 
+import os
 import cv2
 import time
+import subprocess
 
 from pose_detector import PoseDetector
-from angle_calculator import get_knee_angle, get_hip_angle
 from squat_logic import SquatAnalyzer
-from utils import (
-    draw_angle_arc,
-    draw_feedback_panel,
-    draw_instructions,
-    COLOR_GREEN,
-    COLOR_WHITE,
-    COLOR_CYAN,
-)
+from utils import draw_hud, draw_angle_arc, draw_minimal_controls
 
 
-# ──────────────────────────────────────────────
-# Configuration
-# ──────────────────────────────────────────────
 WINDOW_NAME = "Squat Form Analyzer"
-CAMERA_INDEX = 0          # 0 = default webcam
-FRAME_WIDTH = 1280
-FRAME_HEIGHT = 720
+CAMERA_INDEX = 0
 
 
-def _avg_point(p1, p2):
-    """Average two (x, y) points. Returns None if either is None."""
-    if p1 is None or p2 is None:
-        return p1 or p2  # Use whichever is available
-    return ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
+def get_screen_resolution():
+    """Detect primary screen resolution using xrandr."""
+    try:
+        output = subprocess.check_output(['xrandr'], stderr=subprocess.DEVNULL).decode()
+        for line in output.splitlines():
+            if '*' in line:
+                res = line.split()[0]
+                w, h = map(int, res.split('x'))
+                return w, h
+    except Exception:
+        pass
+    return 1920, 1080
+
+
+def fit_to_screen(frame, target_w, target_h):
+    """
+    Seamlessly fit frame to screen dimensions.
+    Performs center-crop if aspect ratio differs to guarantee
+    zero black or white bars, then scales cleanly.
+    """
+    h, w = frame.shape[:2]
+    target_ratio = target_w / target_h
+    current_ratio = w / h
+
+    if abs(current_ratio - target_ratio) > 0.02:
+        if current_ratio > target_ratio:
+            # Frame is wider than target -> center crop width
+            new_w = int(h * target_ratio)
+            start_x = (w - new_w) // 2
+            frame = frame[:, start_x:start_x + new_w]
+        else:
+            # Frame is taller than target -> center crop height
+            new_h = int(w / target_ratio)
+            start_y = (h - new_h) // 2
+            frame = frame[start_y:start_y + new_h, :]
+
+    if frame.shape[1] != target_w or frame.shape[0] != target_h:
+        frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+    return frame
 
 
 def main():
     """Main application loop."""
-
-    # ── Initialize components ──
     print("[INFO] Starting Squat Form Analyzer...")
-    print("[INFO] Press 'Q' to quit, 'R' to reset reps.\n")
+    print("[INFO] Controls: [Q/ESC] Quit  |  [R] Reset Reps  |  [F] Toggle Fullscreen\n")
 
+    screen_w, screen_h = get_screen_resolution()
+    print(f"[INFO] Screen Resolution: {screen_w}x{screen_h}")
+
+    # ── Initialize detector and squat analyzer ──
     detector = PoseDetector(
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.7,
-        smoothing_factor=0.4,
+        min_detection_confidence=0.6,
+        min_tracking_confidence=0.6,
+        smoothing_factor=0.45,
     )
     analyzer = SquatAnalyzer()
 
-    # ── Open webcam ──
+    # ── Open webcam with MJPG 16:9 widescreen capture ──
     cap = cv2.VideoCapture(CAMERA_INDEX)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
     if not cap.isOpened():
-        print("[ERROR] Could not open webcam. Check your camera connection.")
+        print("[ERROR] Could not open webcam. Check camera connection.")
         return
 
-    print(f"[INFO] Camera opened: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
-          f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
+    actual_cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"[INFO] Camera capturing at: {actual_cam_w}x{actual_cam_h}")
 
-    # For FPS calculation
-    prev_time = time.time()
+    # ── Setup Fullscreen Window (Clean, No Qt toolbar) ──
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
+    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    is_fullscreen = True
 
-    # ──────────────────────────────────────────
-    # Main loop
-    # ──────────────────────────────────────────
+    # ── Main processing loop ──
     while True:
         ret, frame = cap.read()
         if not ret:
             print("[WARN] Failed to read frame from webcam.")
             break
 
-        # Mirror the frame so it feels natural
+        # Mirror frame naturally
         frame = cv2.flip(frame, 1)
-        frame_h, frame_w = frame.shape[:2]
 
-        # ── Detect pose landmarks ──
+        # Scale and fit frame to fill screen with zero letterboxing / borders
+        frame = fit_to_screen(frame, screen_w, screen_h)
+
+        # ── Pose Detection ──
         landmarks = detector.detect(frame)
 
-        knee_angle = None
-        hip_angle = None
-
         if landmarks is not None:
-            # Draw skeleton overlay
-            detector.draw_skeleton(frame, landmarks)
+            # Extract side joints & confidence
+            side_data = detector.get_side_data(landmarks, frame)
 
-            # ── Extract key joint positions (both sides) ──
-            left_shoulder = detector.get_landmark_xy(landmarks, "LEFT_SHOULDER", frame)
-            right_shoulder = detector.get_landmark_xy(landmarks, "RIGHT_SHOULDER", frame)
-            left_hip = detector.get_landmark_xy(landmarks, "LEFT_HIP", frame)
-            right_hip = detector.get_landmark_xy(landmarks, "RIGHT_HIP", frame)
-            left_knee = detector.get_landmark_xy(landmarks, "LEFT_KNEE", frame)
-            right_knee = detector.get_landmark_xy(landmarks, "RIGHT_KNEE", frame)
-            left_ankle = detector.get_landmark_xy(landmarks, "LEFT_ANKLE", frame)
-            right_ankle = detector.get_landmark_xy(landmarks, "RIGHT_ANKLE", frame)
+            # Update squat metrics & state machine
+            hud_data = analyzer.update(side_data)
 
-            # Average left + right for more stable readings
-            shoulder = _avg_point(left_shoulder, right_shoulder)
-            hip = _avg_point(left_hip, right_hip)
-            knee = _avg_point(left_knee, right_knee)
-            ankle = _avg_point(left_ankle, right_ankle)
+            # Draw sleek glowing skeleton overlay
+            detector.draw_skeleton(frame, landmarks, active_side=hud_data.get("active_side"))
 
-            # Check that all critical landmarks are available
-            if all(p is not None for p in [shoulder, hip, knee, ankle]):
+            # Draw angle indicator arc at active knee
+            knee_pt = hud_data.get("knee_pt")
+            knee_angle = hud_data.get("knee_angle")
+            if knee_pt is not None and knee_angle is not None:
+                draw_angle_arc(frame, knee_pt, knee_angle, radius=42, color=hud_data.get("color"))
+        else:
+            # No person detected at all
+            hud_data = analyzer.update({"best_side": None})
 
-                # ── Calculate angles ──
-                knee_angle = get_knee_angle(hip, knee, ankle)
-                hip_angle = get_hip_angle(shoulder, hip, knee)
+        # ── Render HUD Card & Minimal Controls ──
+        draw_hud(frame, hud_data)
+        draw_minimal_controls(frame)
 
-                # ── Update squat analyzer ──
-                feedback, feedback_color = analyzer.update(
-                    knee_angle=knee_angle,
-                    hip_angle=hip_angle,
-                    hip_pos=hip,
-                    knee_pos=knee,
-                    ankle_pos=ankle,
-                    frame_width=frame_w,
-                )
-
-                # ── Draw angle arcs at the averaged joint positions ──
-                draw_angle_arc(frame, knee, knee_angle, radius=30,
-                               color=COLOR_CYAN)
-                draw_angle_arc(frame, hip, hip_angle, radius=30,
-                               color=COLOR_GREEN)
-
-        # ── Draw HUD panel ──
-        draw_feedback_panel(
-            frame,
-            feedback_text=analyzer.feedback,
-            feedback_color=analyzer.feedback_color,
-            rep_count=analyzer.rep_count,
-            knee_angle=knee_angle,
-            hip_angle=hip_angle,
-        )
-
-        # ── FPS counter ──
-        current_time = time.time()
-        fps = 1.0 / max(current_time - prev_time, 1e-6)
-        prev_time = current_time
-        cv2.putText(frame, f"FPS: {int(fps)}", (frame_w - 120, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_WHITE, 2, cv2.LINE_AA)
-
-        # ── Keyboard hints ──
-        draw_instructions(frame)
-
-        # ── Show the frame ──
+        # ── Display Frame ──
         cv2.imshow(WINDOW_NAME, frame)
 
-        # ── Handle keyboard input ──
+        # ── Handle Keyboard Input ──
         key = cv2.waitKey(1) & 0xFF
-        if key == ord('q') or key == ord('Q'):
+        if key in (ord('q'), ord('Q'), 27):  # 'Q' or ESC
             print("\n[INFO] Quitting...")
             break
-        elif key == ord('r') or key == ord('R'):
+        elif key in (ord('r'), ord('R')):     # 'R'
             analyzer.reset()
             print("[INFO] Rep counter reset.")
+        elif key in (ord('f'), ord('F')):     # 'F'
+            is_fullscreen = not is_fullscreen
+            prop = cv2.WINDOW_FULLSCREEN if is_fullscreen else cv2.WINDOW_NORMAL
+            cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, prop)
 
     # ── Cleanup ──
     cap.release()
     cv2.destroyAllWindows()
     detector.close()
-    print("[INFO] Application closed. Great workout! 💪")
+    print("[INFO] Application closed cleanly. Great workout! 💪")
 
 
 if __name__ == "__main__":

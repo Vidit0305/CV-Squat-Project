@@ -1,205 +1,169 @@
 """
-squat_logic.py - Squat validation rules, state machine, and rep counting.
-
-The squat cycle state machine:
-    IDLE      →  (standing posture confirmed for N frames)  →  STANDING
-    STANDING  →  (knee angle drops below threshold)         →  SQUATTING
-    SQUATTING →  (knee angle rises above threshold)         →  STANDING  (+1 rep)
-
-Key improvement over naive angle-only detection:
-    • Requires confirmed upright standing posture before counting begins.
-    • Checks that ankles are roughly below hips (rejects sitting in a chair
-      where legs extend forward).
-    • Uses averaged left+right angles for robustness.
-
-Feedback is generated based on:
-    • Knee angle (depth check)
-    • Hip angle (back straightness)
-    • Ankle-under-hip alignment (sitting rejection)
+squat_logic.py - Accurate squat form analysis, depth tracking, and rep counting.
 """
+
+import time
+import numpy as np
+from angle_calculator import get_knee_angle, get_torso_lean
 
 
 class SquatAnalyzer:
     """
-    Analyzes squat form and counts repetitions.
-
-    Attributes:
-        rep_count: Number of completed squat reps.
-        state: Current phase — "IDLE", "STANDING", or "SQUATTING".
-        feedback: Latest feedback string.
-        feedback_color: BGR color matching the feedback severity.
+    Super-accurate, intuitive squat analyzer with real-time depth calculation
+    and clear visual feedback.
     """
 
     # ──────────────────────────────────────────────
-    # Tunable thresholds (degrees)
+    # Biomechanical Thresholds (Degrees)
     # ──────────────────────────────────────────────
-    KNEE_ANGLE_SQUAT = 120     # Below this → transition to SQUATTING
-    KNEE_ANGLE_STAND = 155     # Above this → transition back to STANDING
-    KNEE_ANGLE_DEEP = 100      # Below this → "good depth" achieved
-
-    HIP_ANGLE_MIN = 55         # Below this → back way too bent forward
-    HIP_ANGLE_GOOD_MIN = 65    # Above this → back is acceptably straight
-
-    # Standing confirmation: must see this many consecutive frames with
-    # knee angle > KNEE_ANGLE_STAND before we start tracking squats.
-    STANDING_CONFIRM_FRAMES = 10
-
-    # Maximum horizontal distance (as fraction of frame width) between
-    # ankle and hip x-coordinates. If ankles are too far forward from
-    # hips, the person is likely sitting in a chair, not squatting.
-    MAX_ANKLE_HIP_X_RATIO = 0.20  # 20% of frame width
+    KNEE_STAND_ANGLE = 158.0      # Above this → Standing straight (0% depth)
+    KNEE_SQUAT_START = 142.0      # Below this → Squat descent begins
+    KNEE_TARGET_DEPTH = 100.0     # Target parallel depth (100% depth)
+    KNEE_DEPTH_TOLERANCE = 106.0  # Max angle to qualify as a valid rep
+    MAX_TORSO_LEAN = 45.0         # Above this → Excessive forward lean (chest dropped)
 
     # ──────────────────────────────────────────────
-    # Feedback color palette (BGR)
+    # Color Palette (BGR)
     # ──────────────────────────────────────────────
-    COLOR_GOOD = (0, 230, 118)       # Green
-    COLOR_WARNING = (0, 215, 255)    # Yellow
-    COLOR_BAD = (60, 76, 231)        # Red
-    COLOR_NEUTRAL = (200, 200, 200)  # Gray
+    COLOR_READY = (255, 230, 80)      # Clean Cyan
+    COLOR_GOOD = (0, 235, 120)        # Emerald Green
+    COLOR_WARNING = (0, 215, 255)     # Warm Yellow/Gold
+    COLOR_BAD = (60, 76, 235)         # Vibrant Red
+    COLOR_NEUTRAL = (180, 180, 180)   # Clean Silver Gray
 
     def __init__(self):
         self.rep_count = 0
-        self.state = "IDLE"         # "IDLE", "STANDING", or "SQUATTING"
-        self.feedback = "Stand up straight"
+        self.state = "WAITING"        # WAITING, READY, SQUATTING, REP_COMPLETE
+        self.feedback = "Step back until full body is in view"
         self.feedback_color = self.COLOR_NEUTRAL
+        self.depth_progress = 0.0     # 0.0 to 1.0 (0% to 100%)
+        self.knee_angle = None
+        self.torso_lean = None
+        self.active_side = None
 
-        # Track the minimum knee angle reached during a squat
         self._min_knee_angle = 180.0
-        # Counter for standing confirmation
-        self._standing_frames = 0
+        self._rep_completion_time = 0.0
+        self._min_rep_interval = 0.8  # Prevent double-counts within 0.8s
 
     def reset(self):
-        """Reset rep counter and state."""
+        """Reset rep count and state."""
         self.rep_count = 0
-        self.state = "IDLE"
-        self.feedback = "Stand up straight"
+        self.state = "WAITING"
+        self.feedback = "Step back until full body is in view"
         self.feedback_color = self.COLOR_NEUTRAL
+        self.depth_progress = 0.0
+        self.knee_angle = None
+        self.torso_lean = None
         self._min_knee_angle = 180.0
-        self._standing_frames = 0
+        self._rep_completion_time = 0.0
 
-    def update(self, knee_angle, hip_angle, hip_pos, knee_pos, ankle_pos,
-               frame_width):
+    def update(self, side_data):
         """
-        Process one frame's worth of joint data and update feedback/state.
+        Process detected pose joints and update squat metrics.
 
         Args:
-            knee_angle: Angle at the knee (hip–knee–ankle) in degrees.
-            hip_angle: Angle at the hip (shoulder–hip–knee) in degrees.
-            hip_pos: (x, y) pixel coordinates of the hip.
-            knee_pos: (x, y) pixel coordinates of the knee.
-            ankle_pos: (x, y) pixel coordinates of the ankle.
-            frame_width: Width of the video frame in pixels.
+            side_data: Dictionary returned by PoseDetector.get_side_data(...)
 
         Returns:
-            Tuple of (feedback_text, feedback_color_bgr).
+            Dictionary with feedback, color, rep_count, depth_progress, knee_angle, etc.
         """
-        hip_x, hip_y = hip_pos
-        knee_x, knee_y = knee_pos
-        ankle_x, ankle_y = ankle_pos
+        best_side = side_data.get("best_side")
+        self.active_side = best_side
 
-        # ── Sitting rejection ──
-        # In a chair, ankles are typically far forward of the hips horizontally.
-        # In a squat, ankles stay roughly under or slightly ahead of the hips.
-        ankle_hip_x_dist = abs(ankle_x - hip_x) / max(frame_width, 1)
-        is_sitting_posture = (
-            ankle_hip_x_dist > self.MAX_ANKLE_HIP_X_RATIO
-            and ankle_y < hip_y  # ankles higher than hips on screen = legs forward
-        )
+        # If user is not far enough for full body tracking
+        if best_side is None:
+            self.state = "WAITING"
+            self.feedback = "Step back so legs are visible"
+            self.feedback_color = self.COLOR_WARNING
+            self.depth_progress = 0.0
+            self.knee_angle = None
+            self.torso_lean = None
+            self._min_knee_angle = 180.0
+            return self._build_result(None)
 
-        # ── Back straightness check ──
-        back_ok = hip_angle >= self.HIP_ANGLE_GOOD_MIN
-        back_very_bad = hip_angle < self.HIP_ANGLE_MIN
+        # Extract joints for the best/active side
+        joints = side_data["left"] if best_side == "LEFT" else side_data["right"]
+        shoulder, hip, knee, ankle = joints
 
-        # ────────────────────────────────────────
-        # State: IDLE — waiting for the person to stand upright
-        # ────────────────────────────────────────
-        if self.state == "IDLE":
-            if knee_angle > self.KNEE_ANGLE_STAND and not is_sitting_posture:
-                self._standing_frames += 1
+        # Compute angles
+        knee_angle = get_knee_angle(hip, knee, ankle)
+        torso_lean = get_torso_lean(shoulder, hip)
+        self.knee_angle = knee_angle
+        self.torso_lean = torso_lean
+
+        # Compute continuous depth progress (0.0 = standing at >=158°, 1.0 = target depth at <=100°)
+        depth_raw = (self.KNEE_STAND_ANGLE - knee_angle) / (self.KNEE_STAND_ANGLE - self.KNEE_TARGET_DEPTH)
+        self.depth_progress = float(np.clip(depth_raw, 0.0, 1.0))
+
+        now = time.time()
+
+        # Handle momentary celebratory state after rep completion
+        if self.state == "REP_COMPLETE":
+            if now - self._rep_completion_time > 1.2:
+                self.state = "READY"
+
+        # ── STATE: WAITING -> READY ──
+        if self.state == "WAITING":
+            if knee_angle > self.KNEE_STAND_ANGLE - 5.0:
+                self.state = "READY"
+                self.feedback = "Ready — Squat down"
+                self.feedback_color = self.COLOR_READY
             else:
-                self._standing_frames = 0
+                self.feedback = "Stand tall to begin"
+                self.feedback_color = self.COLOR_READY
 
-            if self._standing_frames >= self.STANDING_CONFIRM_FRAMES:
-                self.state = "STANDING"
-                self._standing_frames = 0
-                self.feedback = "Ready — begin squat"
-                self.feedback_color = self.COLOR_NEUTRAL
-            else:
-                self.feedback = "Stand up straight"
-                self.feedback_color = self.COLOR_NEUTRAL
-
-            return self.feedback, self.feedback_color
-
-        # ────────────────────────────────────────
-        # State: STANDING — waiting for squat to begin
-        # ────────────────────────────────────────
-        if self.state == "STANDING":
-            # If we detect a sitting posture, go back to IDLE
-            if is_sitting_posture:
-                self.state = "IDLE"
-                self._standing_frames = 0
-                self.feedback = "Stand up straight"
-                self.feedback_color = self.COLOR_NEUTRAL
-                return self.feedback, self.feedback_color
-
-            if knee_angle < self.KNEE_ANGLE_SQUAT:
-                # Transition → SQUATTING
+        # ── STATE: READY (Standing) ──
+        elif self.state == "READY":
+            if knee_angle < self.KNEE_SQUAT_START:
                 self.state = "SQUATTING"
                 self._min_knee_angle = knee_angle
+                self.feedback = "Squat down..."
+                self.feedback_color = self.COLOR_WARNING
             else:
-                self.feedback = "Ready — begin squat"
-                self.feedback_color = self.COLOR_NEUTRAL
-                return self.feedback, self.feedback_color
+                self.feedback = "Ready — Squat down"
+                self.feedback_color = self.COLOR_READY
 
-        # ────────────────────────────────────────
-        # State: SQUATTING — tracking the squat movement
-        # ────────────────────────────────────────
-        if self.state == "SQUATTING":
-            # If sitting posture detected mid-squat, reject and reset
-            if is_sitting_posture:
-                self.state = "IDLE"
-                self._standing_frames = 0
-                self._min_knee_angle = 180.0
-                self.feedback = "Stand up — not a squat"
-                self.feedback_color = self.COLOR_BAD
-                return self.feedback, self.feedback_color
-
-            # Track lowest angle
+        # ── STATE: SQUATTING (Descent / Ascent) ──
+        elif self.state == "SQUATTING":
             self._min_knee_angle = min(self._min_knee_angle, knee_angle)
 
-            if knee_angle > self.KNEE_ANGLE_STAND:
-                # Transition → STANDING (rep completed)
-                self.state = "STANDING"
+            # Live feedback during movement
+            if torso_lean > self.MAX_TORSO_LEAN:
+                self.feedback = "Chest Up — Straighten Back!"
+                self.feedback_color = self.COLOR_BAD
+            elif self._min_knee_angle <= self.KNEE_TARGET_DEPTH:
+                self.feedback = "Good Depth — Stand Up!"
+                self.feedback_color = self.COLOR_GOOD
+            else:
+                self.feedback = "Go Lower..."
+                self.feedback_color = self.COLOR_WARNING
 
-                # Evaluate the completed rep
-                if self._min_knee_angle <= self.KNEE_ANGLE_DEEP and back_ok:
+            # Returning to standing
+            if knee_angle >= self.KNEE_STAND_ANGLE - 5.0:
+                # Check if depth was valid
+                if self._min_knee_angle <= self.KNEE_DEPTH_TOLERANCE and (now - self._rep_completion_time) > self._min_rep_interval:
                     self.rep_count += 1
-                    self.feedback = "Good Squat!"
+                    self._rep_completion_time = now
+                    self.state = "REP_COMPLETE"
+                    self.feedback = "Good Rep! (+1)"
                     self.feedback_color = self.COLOR_GOOD
-                elif not back_ok:
-                    self.rep_count += 1
-                    self.feedback = "Keep Back Straight"
-                    self.feedback_color = self.COLOR_BAD
                 else:
-                    self.rep_count += 1
-                    self.feedback = "Go Lower"
+                    self.state = "READY"
+                    self.feedback = "Go Lower Next Time"
                     self.feedback_color = self.COLOR_WARNING
 
                 self._min_knee_angle = 180.0
-                return self.feedback, self.feedback_color
 
-            # ── Live feedback while in the squat ──
-            if back_very_bad:
-                self.feedback = "Keep Back Straight!"
-                self.feedback_color = self.COLOR_BAD
-            elif not back_ok:
-                self.feedback = "Straighten Back"
-                self.feedback_color = self.COLOR_WARNING
-            elif knee_angle > self.KNEE_ANGLE_DEEP:
-                self.feedback = "Go Lower"
-                self.feedback_color = self.COLOR_WARNING
-            else:
-                self.feedback = "Good Depth — Hold!"
-                self.feedback_color = self.COLOR_GOOD
+        return self._build_result(knee)
 
-        return self.feedback, self.feedback_color
+    def _build_result(self, knee_pt):
+        return {
+            "feedback": self.feedback,
+            "color": self.feedback_color,
+            "rep_count": self.rep_count,
+            "depth_progress": self.depth_progress,
+            "knee_angle": self.knee_angle,
+            "torso_lean": self.torso_lean,
+            "active_side": self.active_side,
+            "knee_pt": knee_pt,
+        }

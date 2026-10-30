@@ -1,157 +1,160 @@
 """
-utils.py - Helper functions for drawing overlays and text on the video feed.
+utils.py - High-precision rendering of HUD panels, depth gauges, and angles.
 """
 
 import cv2
 import numpy as np
 
-
 # ──────────────────────────────────────────────
-# Color palette (BGR format for OpenCV)
+# Curated Modern Color Palette (BGR format)
 # ──────────────────────────────────────────────
-COLOR_GREEN = (0, 230, 118)      # Good feedback
-COLOR_RED = (60, 76, 231)        # Bad feedback
-COLOR_YELLOW = (0, 215, 255)     # Warning / go lower
-COLOR_ORANGE = (0, 140, 255)     # Incorrect form
+COLOR_EMERALD = (80, 230, 110)    # Good / Valid / Target reached
+COLOR_CYAN = (255, 220, 40)       # Active / Ready / Tracking
+COLOR_GOLD = (30, 210, 255)       # Warning / Descending
+COLOR_CORAL = (60, 70, 240)       # Alert / Bad posture
 COLOR_WHITE = (255, 255, 255)
-COLOR_BLACK = (0, 0, 0)
-COLOR_CYAN = (255, 255, 0)
-COLOR_SKELETON = (255, 200, 50)  # Skeleton lines
-COLOR_JOINT = (0, 255, 200)      # Joint dots
-COLOR_PANEL_BG = (30, 30, 30)    # Dark panel background
+COLOR_MUTED = (160, 160, 160)
+COLOR_PANEL_BG = (18, 20, 24)     # Deep slate background
+COLOR_SLOT = (45, 50, 58)         # Progress bar slot background
 
 
-def draw_text_with_bg(frame, text, position, font_scale=0.7,
-                      text_color=COLOR_WHITE, bg_color=COLOR_BLACK,
-                      thickness=2, padding=8, alpha=0.7):
+def draw_hud(frame, data):
     """
-    Draw text with a semi-transparent background rectangle.
-    
+    Draw a clean, modern, high-contrast workout HUD.
+    Displays only the essential metrics: Rep Count, Form Feedback,
+    Depth Progress Bar, and Knee Angle.
+
     Args:
-        frame: The video frame (modified in-place).
-        text: The string to display.
-        position: (x, y) top-left corner of the text.
-        font_scale: Font size multiplier.
-        text_color: BGR color for the text.
-        bg_color: BGR color for the background rectangle.
-        thickness: Text thickness.
-        padding: Padding around the text inside the rectangle.
-        alpha: Opacity of the background (0.0 to 1.0).
-    """
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    x, y = position
-
-    # Measure the text size
-    (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-
-    # Rectangle coordinates
-    x1 = x - padding
-    y1 = y - text_h - padding
-    x2 = x + text_w + padding
-    y2 = y + baseline + padding
-
-    # Clamp to frame boundaries
-    h, w = frame.shape[:2]
-    x1 = max(0, x1)
-    y1 = max(0, y1)
-    x2 = min(w, x2)
-    y2 = min(h, y2)
-
-    # Semi-transparent overlay
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (x1, y1), (x2, y2), bg_color, -1)
-    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-
-    # Draw the text
-    cv2.putText(frame, text, (x, y), font, font_scale, text_color, thickness,
-                cv2.LINE_AA)
-
-
-def draw_angle_arc(frame, center, angle_deg, radius=40, color=COLOR_CYAN,
-                   thickness=2):
-    """
-    Draw a small arc near a joint to visualize the measured angle.
-    
-    Args:
-        frame: The video frame.
-        center: (x, y) joint position in pixel coordinates.
-        angle_deg: The angle value to display.
-        radius: Arc radius in pixels.
-        color: BGR color.
-        thickness: Line thickness.
-    """
-    # Draw a circle outline at the joint
-    cv2.circle(frame, center, radius, color, thickness, cv2.LINE_AA)
-
-    # Put the angle value near the joint
-    text = f"{int(angle_deg)} deg"
-    text_pos = (center[0] + radius + 5, center[1] - 5)
-    draw_text_with_bg(frame, text, text_pos, font_scale=0.5,
-                      text_color=color, bg_color=COLOR_BLACK,
-                      thickness=1, padding=4, alpha=0.6)
-
-
-def draw_feedback_panel(frame, feedback_text, feedback_color, rep_count,
-                        knee_angle, hip_angle):
-    """
-    Draw a heads-up display panel with feedback, rep count, and angles.
-    
-    Args:
-        frame: The video frame.
-        feedback_text: The main feedback string (e.g. "Good Squat").
-        feedback_color: BGR color matching the feedback severity.
-        rep_count: Current repetition count.
-        knee_angle: Current knee angle in degrees (or None).
-        hip_angle: Current hip angle in degrees (or None).
+        frame: The video frame to draw on (modified in-place).
+        data: Dict containing 'feedback', 'color', 'rep_count',
+              'depth_progress', 'knee_angle', 'torso_lean', etc.
     """
     h, w = frame.shape[:2]
-    panel_h = 160
-    panel_w = 320
 
-    # Draw semi-transparent panel in the top-left corner
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (10, 10), (10 + panel_w, 10 + panel_h),
-                  COLOR_PANEL_BG, -1)
-    cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+    # Panel dimensions & position (top-left)
+    panel_x = 30
+    panel_y = 30
+    panel_w = 460
+    panel_h = 210
 
-    # Border
-    cv2.rectangle(frame, (10, 10), (10 + panel_w, 10 + panel_h),
-                  feedback_color, 2, cv2.LINE_AA)
+    # 1. Glassmorphism dark background panel
+    sub_img = frame[panel_y:panel_y + panel_h, panel_x:panel_x + panel_w]
+    bg_rect = np.full(sub_img.shape, COLOR_PANEL_BG, dtype=np.uint8)
+    blended = cv2.addWeighted(bg_rect, 0.82, sub_img, 0.18, 0)
+    frame[panel_y:panel_y + panel_h, panel_x:panel_x + panel_w] = blended
 
-    # Title
-    draw_text_with_bg(frame, "SQUAT ANALYZER", (25, 40),
-                      font_scale=0.65, text_color=COLOR_WHITE,
-                      bg_color=(0, 0, 0), thickness=2, padding=4, alpha=0.0)
+    # 2. Glowing Accent Border matching current status color
+    border_color = data.get("color", COLOR_CYAN)
+    cv2.rectangle(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h),
+                  border_color, 2, cv2.LINE_AA)
 
-    # Feedback line
-    draw_text_with_bg(frame, feedback_text, (25, 72),
-                      font_scale=0.7, text_color=feedback_color,
-                      bg_color=(0, 0, 0), thickness=2, padding=4, alpha=0.0)
+    # 3. Header: App title + Large Rep Counter Badge
+    cv2.putText(frame, "SQUAT AI COACH", (panel_x + 20, panel_y + 35),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_MUTED, 1, cv2.LINE_AA)
 
-    # Rep counter
-    draw_text_with_bg(frame, f"Reps: {rep_count}", (25, 102),
-                      font_scale=0.6, text_color=COLOR_WHITE,
-                      bg_color=(0, 0, 0), thickness=2, padding=4, alpha=0.0)
+    # Rep count pill badge (top-right of panel)
+    rep_text = f"REPS: {data.get('rep_count', 0)}"
+    (rw, rh), _ = cv2.getTextSize(rep_text, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)
+    pill_x = panel_x + panel_w - rw - 35
+    pill_y = panel_y + 15
+    cv2.rectangle(frame, (pill_x - 10, pill_y), (pill_x + rw + 10, pill_y + rh + 14),
+                  (35, 42, 52), -1)
+    cv2.rectangle(frame, (pill_x - 10, pill_y), (pill_x + rw + 10, pill_y + rh + 14),
+                  COLOR_EMERALD, 2, cv2.LINE_AA)
+    cv2.putText(frame, rep_text, (pill_x, pill_y + rh + 7),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, COLOR_WHITE, 2, cv2.LINE_AA)
 
-    # Angles
-    knee_str = f"Knee: {int(knee_angle)} deg" if knee_angle is not None else "Knee: --"
-    hip_str = f"Hip:  {int(hip_angle)} deg" if hip_angle is not None else "Hip:  --"
+    # 4. Large Form Feedback Headline
+    feedback = data.get("feedback", "Ready")
+    cv2.putText(frame, feedback, (panel_x + 20, panel_y + 85),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.82, border_color, 2, cv2.LINE_AA)
 
-    draw_text_with_bg(frame, knee_str, (25, 130),
-                      font_scale=0.5, text_color=COLOR_CYAN,
-                      bg_color=(0, 0, 0), thickness=1, padding=4, alpha=0.0)
-    draw_text_with_bg(frame, hip_str, (25, 155),
-                      font_scale=0.5, text_color=COLOR_CYAN,
-                      bg_color=(0, 0, 0), thickness=1, padding=4, alpha=0.0)
+    # 5. Squat Depth Progress Bar
+    bar_x = panel_x + 20
+    bar_y = panel_y + 125
+    bar_w = panel_w - 40
+    bar_h = 22
+
+    # Background slot
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h),
+                  COLOR_SLOT, -1)
+
+    # Filled progress
+    progress = data.get("depth_progress", 0.0)
+    fill_w = int(bar_w * progress)
+
+    if progress >= 0.95:
+        bar_color = COLOR_EMERALD
+    elif progress >= 0.5:
+        bar_color = COLOR_GOLD
+    else:
+        bar_color = COLOR_CYAN
+
+    if fill_w > 0:
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h),
+                      bar_color, -1)
+
+    # Target depth mark at 100%
+    cv2.rectangle(frame, (bar_x + bar_w - 3, bar_y - 3),
+                  (bar_x + bar_w, bar_y + bar_h + 3), COLOR_WHITE, -1)
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h),
+                  (80, 85, 95), 1, cv2.LINE_AA)
+
+    # Depth labels
+    pct = int(progress * 100)
+    cv2.putText(frame, f"Squat Depth: {pct}%", (bar_x, bar_y - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_WHITE, 1, cv2.LINE_AA)
+    cv2.putText(frame, "Target Depth", (bar_x + bar_w - 95, bar_y - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_MUTED, 1, cv2.LINE_AA)
+
+    # 6. Knee Angle Metric
+    knee_angle = data.get("knee_angle")
+    if knee_angle is not None:
+        angle_str = f"Knee Angle: {int(knee_angle)} deg  (Target: <=100 deg)"
+    else:
+        angle_str = "Knee Angle: --"
+    cv2.putText(frame, angle_str, (panel_x + 20, panel_y + 185),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, COLOR_WHITE, 1, cv2.LINE_AA)
 
 
-def draw_instructions(frame):
+def draw_angle_arc(frame, center, angle_deg, radius=42, color=COLOR_CYAN):
     """
-    Draw keyboard shortcut hints at the bottom of the frame.
+    Draw a clean circular indicator and degree readout near the knee joint.
+    """
+    if center is None or angle_deg is None:
+        return
+
+    x, y = center
+    # Outer ring
+    cv2.circle(frame, (x, y), radius, color, 2, cv2.LINE_AA)
+
+    # Degree label tag
+    deg_str = f"{int(angle_deg)} deg"
+    (tw, th), _ = cv2.getTextSize(deg_str, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+    tag_x = x + radius + 8
+    tag_y = y - 5
+
+    # Tag background
+    cv2.rectangle(frame, (tag_x - 4, tag_y - th - 4),
+                  (tag_x + tw + 4, tag_y + 4), (20, 20, 20), -1)
+    cv2.rectangle(frame, (tag_x - 4, tag_y - th - 4),
+                  (tag_x + tw + 4, tag_y + 4), color, 1, cv2.LINE_AA)
+    cv2.putText(frame, deg_str, (tag_x, tag_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, COLOR_WHITE, 1, cv2.LINE_AA)
+
+
+def draw_minimal_controls(frame):
+    """
+    Subtle keyboard hint in the bottom-right corner.
     """
     h, w = frame.shape[:2]
-    instructions = "Press 'Q' to Quit  |  'R' to Reset Reps"
-    draw_text_with_bg(frame, instructions, (15, h - 15),
-                      font_scale=0.45, text_color=COLOR_WHITE,
-                      bg_color=COLOR_PANEL_BG, thickness=1, padding=6,
-                      alpha=0.7)
+    hint = "[Q] Quit   |   [R] Reset Reps"
+    (tw, th), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+    x = w - tw - 25
+    y = h - 20
+
+    # Soft dark background
+    cv2.rectangle(frame, (x - 8, y - th - 6), (x + tw + 8, y + 6),
+                  (20, 20, 24), -1)
+    cv2.putText(frame, hint, (x, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)

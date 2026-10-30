@@ -116,7 +116,7 @@ class PoseDetector:
         # ── EMA Smoothing ──
         self._smoothing_factor = smoothing_factor  # alpha: higher = more responsive
         self._smoothed_landmarks = {}  # name → (x_smooth, y_smooth) in normalized coords
-        self._min_visibility = 0.65    # Only use landmarks above this visibility
+        self._min_visibility = 0.45    # Reliable tracking even in normal indoor lighting
 
     def detect(self, frame):
         """
@@ -128,15 +128,11 @@ class PoseDetector:
         Returns:
             A list of normalized landmarks for the first detected person,
             or None if no person was detected.
-            Each landmark has .x, .y, .z (normalized 0-1) and .visibility.
         """
-        # Convert BGR → RGB for MediaPipe
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
-        # Increment timestamp (must be monotonically increasing in VIDEO mode)
         self._frame_timestamp_ms += 33  # ~30 FPS equivalent
-
         result = self.landmarker.detect_for_video(mp_image, self._frame_timestamp_ms)
 
         if result.pose_landmarks and len(result.pose_landmarks) > 0:
@@ -146,19 +142,13 @@ class PoseDetector:
         return None
 
     def _update_smoothing(self, landmarks):
-        """
-        Update the EMA-smoothed positions for all tracked landmarks.
-
-        Args:
-            landmarks: Raw landmark list from MediaPipe.
-        """
+        """Update EMA-smoothed positions for tracked landmarks."""
         alpha = self._smoothing_factor
 
         for name, enum_val in self.LANDMARK_NAMES.items():
             idx = enum_val.value
             lm = landmarks[idx]
 
-            # Skip low-visibility landmarks (don't pollute the smoother)
             if lm.visibility < self._min_visibility:
                 continue
 
@@ -169,25 +159,14 @@ class PoseDetector:
                 smooth_x = alpha * raw_x + (1 - alpha) * prev_x
                 smooth_y = alpha * raw_y + (1 - alpha) * prev_y
             else:
-                # First frame: initialize directly
                 smooth_x, smooth_y = raw_x, raw_y
 
             self._smoothed_landmarks[name] = (smooth_x, smooth_y)
 
     def get_landmark_xy(self, landmarks, name, frame):
         """
-        Get the SMOOTHED (x, y) pixel coordinates of a named landmark.
-
-        Uses EMA-filtered positions for stable rendering. Falls back to raw
-        coordinates if no smoothed data is available.
-
-        Args:
-            landmarks: The list of NormalizedLandmark from detect().
-            name: One of the keys in LANDMARK_NAMES (e.g. "LEFT_KNEE").
-            frame: The video frame (used to convert normalized → pixel coords).
-
-        Returns:
-            (x, y) tuple in pixel coordinates, or None if landmark not visible.
+        Get smoothed (x, y) pixel coordinates of a landmark.
+        Returns None if below visibility threshold.
         """
         if name not in self.LANDMARK_NAMES:
             return None
@@ -195,13 +174,10 @@ class PoseDetector:
         idx = self.LANDMARK_NAMES[name].value
         lm = landmarks[idx]
 
-        # Reject low-visibility landmarks entirely
         if lm.visibility < self._min_visibility:
             return None
 
         h, w = frame.shape[:2]
-
-        # Use smoothed coordinates if available
         if name in self._smoothed_landmarks:
             sx, sy = self._smoothed_landmarks[name]
             x = int(sx * w)
@@ -213,55 +189,89 @@ class PoseDetector:
         return (x, y)
 
     def get_landmark_visibility(self, landmarks, name):
-        """
-        Get the visibility confidence of a named landmark.
-
-        Args:
-            landmarks: The landmark list.
-            name: Landmark name string.
-
-        Returns:
-            Visibility score (0.0–1.0), or 0.0 if not found.
-        """
+        """Get visibility score (0.0–1.0) of a named landmark."""
         if name not in self.LANDMARK_NAMES:
             return 0.0
-
         idx = self.LANDMARK_NAMES[name].value
-        return landmarks[idx].visibility
+        return float(landmarks[idx].visibility)
 
-    def draw_skeleton(self, frame, landmarks, line_color=(255, 200, 50),
-                      joint_color=(0, 255, 200), line_thickness=3,
-                      joint_radius=6):
+    def get_side_data(self, landmarks, frame):
         """
-        Draw custom skeleton lines and joint circles on the frame
-        using smoothed landmark positions.
+        Extract joints and confidence for left and right body sides.
+        Returns:
+            dict containing left joints, right joints, visibilities, and best side.
+        """
+        left_shoulder = self.get_landmark_xy(landmarks, "LEFT_SHOULDER", frame)
+        right_shoulder = self.get_landmark_xy(landmarks, "RIGHT_SHOULDER", frame)
+        left_hip = self.get_landmark_xy(landmarks, "LEFT_HIP", frame)
+        right_hip = self.get_landmark_xy(landmarks, "RIGHT_HIP", frame)
+        left_knee = self.get_landmark_xy(landmarks, "LEFT_KNEE", frame)
+        right_knee = self.get_landmark_xy(landmarks, "RIGHT_KNEE", frame)
+        left_ankle = self.get_landmark_xy(landmarks, "LEFT_ANKLE", frame)
+        right_ankle = self.get_landmark_xy(landmarks, "RIGHT_ANKLE", frame)
 
-        Args:
-            frame: The video frame (modified in-place).
-            landmarks: The landmark list from detect().
-            line_color: BGR color for skeleton lines.
-            joint_color: BGR color for joint circles.
-            line_thickness: Thickness of skeleton lines.
-            joint_radius: Radius of joint circles.
+        v_left = (self.get_landmark_visibility(landmarks, "LEFT_HIP") +
+                  self.get_landmark_visibility(landmarks, "LEFT_KNEE") +
+                  self.get_landmark_visibility(landmarks, "LEFT_ANKLE")) / 3.0
+
+        v_right = (self.get_landmark_visibility(landmarks, "RIGHT_HIP") +
+                   self.get_landmark_visibility(landmarks, "RIGHT_KNEE") +
+                   self.get_landmark_visibility(landmarks, "RIGHT_ANKLE")) / 3.0
+
+        left_valid = all(p is not None for p in [left_shoulder, left_hip, left_knee, left_ankle])
+        right_valid = all(p is not None for p in [right_shoulder, right_hip, right_knee, right_ankle])
+
+        best_side = None
+        if left_valid and right_valid:
+            best_side = "LEFT" if v_left >= v_right else "RIGHT"
+        elif left_valid:
+            best_side = "LEFT"
+        elif right_valid:
+            best_side = "RIGHT"
+
+        return {
+            "left": (left_shoulder, left_hip, left_knee, left_ankle),
+            "right": (right_shoulder, right_hip, right_knee, right_ankle),
+            "v_left": v_left,
+            "v_right": v_right,
+            "left_valid": left_valid,
+            "right_valid": right_valid,
+            "best_side": best_side,
+        }
+
+    def draw_skeleton(self, frame, landmarks, active_side=None):
         """
-        # Collect smoothed pixel positions for all tracked landmarks
+        Draw sleek, high-tech glowing skeleton overlay.
+        """
         positions = {}
         for name in self.LANDMARK_NAMES:
             pos = self.get_landmark_xy(landmarks, name, frame)
             if pos is not None:
                 positions[name] = pos
 
-        # Draw skeleton lines
+        # Base line color (slate blue / subtle)
+        base_line_color = (220, 160, 40)
+        active_line_color = (0, 240, 255)  # Cyan/Gold for active side
+
+        # Draw skeleton connections
         for start_name, end_name in self.SKELETON_CONNECTIONS:
             if start_name in positions and end_name in positions:
+                is_active = (active_side and active_side in start_name and active_side in end_name)
+                color = active_line_color if is_active else base_line_color
+                thickness = 4 if is_active else 2
                 cv2.line(frame, positions[start_name], positions[end_name],
-                         line_color, line_thickness, cv2.LINE_AA)
+                         color, thickness, cv2.LINE_AA)
 
-        # Draw joint circles on top
+        # Draw glowing joint nodes
         for name, pos in positions.items():
-            cv2.circle(frame, pos, joint_radius, joint_color, -1, cv2.LINE_AA)
-            cv2.circle(frame, pos, joint_radius + 2, line_color, 1, cv2.LINE_AA)
+            is_active_node = (active_side and active_side in name)
+            inner_color = (0, 255, 180) if is_active_node else (0, 220, 255)
+            # Outer soft glow ring
+            cv2.circle(frame, pos, 8, (255, 255, 255), 1, cv2.LINE_AA)
+            # Inner solid circle
+            cv2.circle(frame, pos, 5, inner_color, -1, cv2.LINE_AA)
 
     def close(self):
         """Release MediaPipe resources."""
         self.landmarker.close()
+

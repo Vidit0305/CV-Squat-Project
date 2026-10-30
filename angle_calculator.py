@@ -81,3 +81,24 @@ def get_hip_angle(shoulder, hip, knee):
         Hip angle in degrees.
     """
     return calculate_angle(shoulder, hip, knee)
+
+
+def get_torso_lean(shoulder, hip):
+    """
+    Calculate torso forward lean angle relative to vertical in degrees.
+
+    0° = perfectly upright torso.
+    15°–35° = standard healthy squat hinge.
+    >45° = excessive forward lean (chest collapsing).
+
+    Args:
+        shoulder: (x, y) coordinates of shoulder.
+        hip: (x, y) coordinates of hip.
+
+    Returns:
+        Lean angle in degrees.
+    """
+    dx = abs(float(shoulder[0]) - float(hip[0]))
+    dy = max(float(hip[1]) - float(shoulder[1]), 1e-5)
+    return float(np.degrees(np.arctan2(dx, dy)))
+
